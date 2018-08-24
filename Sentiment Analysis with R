@@ -1,0 +1,378 @@
+install.packages("topicmodels")
+install.packages("sentimentr")
+
+library(topicmodels)
+library(tidytext)
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(sentimentr)
+library(lubridate)
+
+setwd("C:/Users/nc169de/Desktop/ASD/1. Sentiment analysis project")
+
+#A. Import Data-----------------
+guardian <- fread("Guardian complete.csv")
+guardian$news_outlet <- "Guardian"
+
+punch <- fread("Punch complete.csv")
+punch$news_outlet <- "Punch"
+
+vanguard <- fread("Vanguard complete.csv")
+vanguard$news_outlet <- "Vanguard"
+
+this_day <- fread("This day complete.csv")
+this_day$news_outlet <- "This day"
+
+sahara <- fread("Sahara.csv")
+sahara$news_outlet <- "Sahara"
+
+
+#B. Data Preparation------------
+#1. Change all headline words into lowercase for standardization
+guardian$Headlines %<>% tolower()
+punch$Headlines %<>% tolower()
+vanguard$Headlines %<>% tolower()
+this_day$Headlines %<>% tolower()
+sahara$Headlines %<>% tolower()
+
+#2. Format the date to POSIXct
+guardian$NewDate <- as.POSIXct(guardian$Date, format='%A, %B %d, %Y')
+punch$NewDate <- as.POSIXct(punch$Date, format='%A, %B %d, %Y')
+vanguard$NewDate <- as.POSIXct(vanguard$Date, format='%A, %B %d, %Y')
+this_day$NewDate <- as.POSIXct(this_day$Date, format='%A, %B %d, %Y')
+sahara$NewDate <- as.POSIXct(sahara$Date, format='%A, %B %d, %Y')
+
+guardian$Date <- NULL
+punch$Date <- NULL
+vanguard$Date <- NULL
+this_day$Date <- NULL
+sahara$Date <- NULL
+
+#3. Filter out 2010 data
+guardian <- guardian[year(guardian$NewDate) > 2010]
+punch <- punch[year(punch$NewDate) > 2010]
+vanguard <- vanguard[year(vanguard$NewDate) > 2010]
+this_day <- this_day[year(this_day$NewDate) > 2010]
+sahara <- sahara[year(sahara$NewDate) > 2010]
+
+#4. Split into 2011-2015, 2015-2018
+add_tenure <- function(outlet) {
+  temp <- bind_rows(outlet[year(outlet$NewDate) %in% 2011:2014],
+                    outlet[year(outlet$NewDate) %in% 2015 & month(outlet$NewDate) %in% 1:5])
+  temp$tenure <- 1
+  temp2 <- outlet[not(outlet$Headlines %in% temp$Headlines)]
+  temp2$tenure <- 2
+  x <- bind_rows(temp,temp2)
+  return(x)
+  }
+
+guardian <- add_tenure(guardian)
+punch <- add_tenure(punch)
+vanguard <- add_tenure(vanguard)
+this_day <- add_tenure(this_day)
+sahara <- add_tenure(sahara)
+
+#5. Remove Adverts
+#To be mentioned in the article-Eliminate adverts from Vanguard - erection, s3x, viagra
+vanguard %>%
+  filter(str_detect(Headlines, "erection"))
+vanguard <- vanguard[!grep(c("s3x"), vanguard$Headlines),]
+
+#C. Exploratory analysis-----------
+data("stop_words")
+
+#1. Check top 15 words reported by each outlet per year
+#This visualizations should form a dashboard
+top_words <- function(outlet) {
+  words <- outlet %>%
+    unnest_tokens(word, Headlines) %>%
+    anti_join(stop_words) %>%
+    count(year= year(NewDate),word, sort =T)
+
+  words %>%
+    group_by(year) %>%
+    arrange(desc(n)) %>%
+    top_n(10,n) %>%
+    ungroup() %>%
+    mutate(word = reorder(word, n)) %>%
+    ggplot(aes(word, n, fill = year)) +
+    geom_col(show.legend = F) +
+    labs(x = NULL, y = "Word Count") +
+    facet_wrap(~year, ncol = 3, scales = "free") +
+    coord_flip()}
+
+#Guardian
+top_words(guardian)
+#Punch - Police(Sentiment analysis on their hedlines), FG,court(investigate)
+top_words(punch)
+#Vanguard - Similar top words in Punch and Vanguard. Good for deeper analysis of shared top words
+top_words(vanguard)
+#This day - Good for investigaton on the oil sector, 
+top_words(this_day)
+
+#2. General sentiment of alll headlines per year combining all outlets
+plot_sentiment<- function(outlet){
+  outlet %>%
+    unnest_tokens(word,Headlines) %>%
+    inner_join(get_sentiments("nrc")) %>%
+    count(year = year(NewDate),sentiment) %>%
+    arrange(desc(n)) %>%
+    mutate(sentiment = factor(sentiment, levels = rev(unique(sentiment)))) %>% 
+    ggplot(aes(sentiment,n, fill = year)) +
+    geom_col(show.legend = FALSE) +
+    labs(x=NULL) +
+    facet_wrap(~year, scales = "free_x") +
+    coord_flip()  }
+
+plot_sentiment(guardian)
+plot_sentiment(punch)
+plot_sentiment(vanguard)
+plot_sentiment(this_day)
+
+#3. Investigate buzzwords in the newsoutlets - sentiment for words
+#jonathan,buhari,osinbajo,sambo,police,court,apc,pdp
+bind_rows(sahara,punch,vanguard,this_day) %>%
+  group_by(news_outlet) %>%
+  filter(str_detect(Headlines,"buhari")) %>%
+  unnest_tokens(word,Headlines) %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(d=lubridate::floor_date(NewDate,"2 months"), sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative) %>%
+  ggplot() +
+  geom_line(aes(d, sentiment),color="red") +
+  geom_line(aes(d,0)) +
+  facet_wrap(~news_outlet) +
+  theme(axis.text.x=element_text(angle=90,hjust=1))
+
+
+#3. Term freq & IDF (After splitting the years) 
+#It allows us find words that are characteristic for one news outlet within a collection of news items
+plot_termfreq <- function(outlet, x) {
+  news_words <- outlet %>%
+    filter(tenure == x) %>%
+    unnest_tokens(word,Headlines) %>%
+    anti_join(stop_words) %>%
+    count(news_outlet,word, sort = T) %>%
+    ungroup()
+  
+  news_words <- news_words %>%
+    bind_tf_idf(word,news_outlet,n)
+  
+  news_words %>% 
+    group_by(news_outlet) %>% 
+    top_n(15) %>% 
+    ungroup() %>%
+    mutate(word = reorder(word, tf_idf)) %>%
+    ggplot(aes(word, tf_idf, fill = news_outlet)) +
+    geom_col(show.legend = FALSE) +
+    labs(x = NULL, y = "tf-idf") +
+    facet_wrap(~news_outlet, nrow = 2, scales = "free") +
+    coord_flip()
+}
+plot_termfreq(bind_rows(guardian,punch,vanguard,this_day), 1)
+
+#To be mentioned in the article-Eliminate adverts from Vanguard - erection, s3x, viagra
+#athletics,cup,games,
+vanguard %>%
+  filter(str_detect(Headlines, "sport"))
+vanguard <- vanguard[grep(c("viagra"), vanguard$Headlines),]
+
+#D. Data analysis-----------
+#Insights
+#1. Punch does more sports reporting (ryder,rory) and finacial reporting
+#2. Vanguard reports more on political news and narrows down on news in states in the country
+
+#Trend analysis of each day for the sentiment of different news outlets - for GEJ and Buhari, etc
+#Box plot - per candidate, GEJ related headlines 
+#Bigram - analyse monthly basis
+
+#Buzzword comparison sentiment - Buhari/Jonathan
+get_buzzsentiment <- function(outlet,buzz){
+  outlet %>% filter(str_detect(Headlines,buzz)) %>%
+  mutate(sentence_split = get_sentences(Headlines), timeline=lubridate::floor_date(NewDate,"2 months")) %$%
+  sentiment_by(sentence_split, timeline) %>%
+  select(timeline,ave_sentiment)}
+
+
+jonathan <- bind_rows(mutate(get_buzzsentiment(punch,"jonathan"),outlet="Punch"),
+                      mutate(get_buzzsentiment(guardian,"jonathan"),outlet="Guardian"),
+                      mutate(get_buzzsentiment(vanguard,"jonathan"),outlet="Vanguard"),
+                      mutate(get_buzzsentiment(this_day,"jonathan"),outlet="This day"))
+
+buhari <- bind_rows(mutate(get_buzzsentiment(punch,"buhari"),outlet="Punch"),
+                      mutate(get_buzzsentiment(guardian,"buhari"),outlet="Guardian"),
+                      mutate(get_buzzsentiment(vanguard,"buhari"),outlet="Vanguard"),
+                      mutate(get_buzzsentiment(this_day,"buhari"),outlet="This day"))
+
+osinbajo <- bind_rows(mutate(get_buzzsentiment(punch,"osinbajo"),outlet="Punch"),
+                    mutate(get_buzzsentiment(guardian,"osinbajo"),outlet="Guardian"),
+                    mutate(get_buzzsentiment(vanguard,"osinbajo"),outlet="Vanguard"),
+                    mutate(get_buzzsentiment(this_day,"osinbajo"),outlet="This day"))
+
+osinbajo %>%
+  ggplot(aes(timeline,ave_sentiment,fill=outlet)) +
+  geom_col(show.legend = F) +
+  xlab(NULL) +
+  facet_wrap(~outlet, ncol = 1)+
+  theme(axis.text.x=element_text(angle=90,hjust=1))
+
+lubridate::floor_date()
+
+pressy <- bind_rows(mutate(jonathan, tenure="GEJ"),
+                    mutate(buhari, tenure="PMB"))
+pressy %>%
+  ggplot(aes(tenure,ave_sentiment))+
+  geom_boxplot(outlier.colour="red")+
+  facet_wrap(~outlet)
+
+#Buzzword per tenure
+get_buzz <- function(outlet,buzz,ten)
+{ outlet %>%
+    filter(str_detect(Headlines,buzz) & tenure == as.character(ten)) %>%
+    mutate(sentence_split = get_sentences(Headlines),
+           timeseries=lubridate::floor_date(NewDate,"1 months")) %$%
+    sentiment_by(sentence_split, timeseries) %>%
+    select(-sd)}
+
+name <- c("guardian","punch","vanguard","this_day")
+
+append_tenure <- function(buzz,tenure) {
+  buzz_sentiment <- lapply(list(guardian,punch,vanguard,this_day),function(x){get_buzz(x,buzz,tenure)})
+  buzz_sentiment <- mapply(cbind, buzz_sentiment, "Outlet"=name, SIMPLIFY = F)
+  buzz_sentiment <- do.call(rbind,lapply(buzz_sentiment,function(x) x[,1:4]))
+  buzz_sentiment$tenure <- as.character(tenure)
+  return(buzz_sentiment)
+}
+
+court <- rbind(append_tenure("court",1),append_tenure("court",2))
+fg <-  rbind(append_tenure("fg",1),append_tenure("fg",2))
+
+court %>%
+  ggplot(aes(tenure,ave_sentiment))+
+  geom_boxplot(outlier.colour="red")+
+  facet_wrap(~Outlet, scales="free_y")
+
+#Bigram analysis
+bigram1 <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  filter(tenure==1) %>%
+  group_by(news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  unite(bigram, word1, word2, sep = " ") %>%
+  count(bigram,sort=T)
+
+bigram2 <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  filter(tenure==2) %>%
+  group_by(news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  unite(bigram, word1, word2, sep = " ") %>%
+  count(bigram,sort=T)
+
+bigram2 %>% 
+  group_by(news_outlet) %>% 
+  top_n(15) %>% 
+  ungroup() %>%
+  mutate(bigram = reorder(bigram, n)) %>%
+  ggplot(aes(bigram, n, fill = news_outlet)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~news_outlet, nrow = 2, scales = "free") +
+  coord_flip()
+
+this_day %>%
+  filter(tenure==1) %>%
+  unnest_tokens(trigram, Headlines, token = "ngrams", n = 3) %>%
+  separate(trigram, c("word1", "word2", "word3"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word,
+         !word2 %in% stop_words$word,
+         !word3 %in% stop_words$word) %>%
+  count(word1, word2, word3, sort = TRUE)
+
+#Investigating buzzword bigrams
+buhari <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  filter(tenure==2) %>%
+  group_by(news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  filter(word2=="buhari") %>%
+  count(word1,sort = T)
+
+jonathan <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  filter(tenure==1) %>%
+  group_by(news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  filter(word2=="jonathan") %>%
+  count(word1,sort = T)
+
+men <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  filter(tenure==1) %>%
+  group_by(news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  filter(word1=="security") %>%
+  count(word2,sort = T)
+
+buhari_bigram <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  group_by(tenure,news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(word1 == "buhari") %>%
+  inner_join(get_sentiments("afinn"), by = c(word2 = "word")) %>%
+  count(word2, score, sort = TRUE) %>%
+  ungroup()
+
+buhari_bigram %>%
+  mutate(contribution = n * score) %>%
+  arrange(desc(abs(contribution))) %>%
+  mutate(word2 = reorder(word2, contribution)) %>%
+  filter(tenure==2) %>%
+  head(30) %>%
+  ggplot(aes(word2, n * score, fill = n * score > 0)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "n") +
+  facet_wrap(tenure~news_outlet, nrow = 2, scales = "free") +
+  coord_flip()
+
+presidents <- c("buhari", "jonathan")
+president <- bind_rows(guardian,punch,vanguard,this_day) %>%
+  group_by(news_outlet) %>%
+  unnest_tokens(bigram,Headlines,token = "ngrams",n=2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(word1 %in% presidents) %>%
+  inner_join(get_sentiments("afinn"), by = c(word2 = "word")) %>%
+  count(word1, word2, score, sort = TRUE) %>%
+  ungroup()
+
+president %>%
+  group_by(news_outlet) %>% 
+  top_n(10) %>% 
+  ungroup() %>%
+  mutate(contribution = n * score) %>%
+  mutate(word2 = reorder(word2, contribution)) %>%
+  ggplot(aes(word2, n * score, fill = n * score > 0)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "n") +
+  facet_grid(word1~news_outlet, scales = "free") +
+  coord_flip()
+
+vanguard %>%
+  filter(str_detect(Headlines,"jonathan promises")) #Display the headlines associated with top bigrams
+#A dashboard can dosplay the top words associated with a particular individual and also spool the headlines associated with these words
+
